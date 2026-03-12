@@ -188,10 +188,12 @@ class MultiMonitorsActivitiesButton extends PanelMenu.Button {
 
         this._showingId = Main.overview.connect('showing', () => {
             this.add_style_pseudo_class('overview');
+            this.add_style_pseudo_class('checked');
             this.add_accessible_state(Atk.StateType.CHECKED);
         });
         this._hidingId = Main.overview.connect('hiding', () => {
             this.remove_style_pseudo_class('overview');
+            this.remove_style_pseudo_class('checked');
             this.remove_accessible_state(Atk.StateType.CHECKED);
         });
     }
@@ -225,8 +227,65 @@ class MultiMonitorsQuickSettings extends PanelMenu.Button {
         if (qs) {
             // _indicators is the St.BoxLayout that holds all the status icons.
             const source = qs._indicators ?? qs;
+            this._cloneSource = source;
             this._clone = new Clutter.Clone({ source });
             this.add_child(this._clone);
+
+            // Keep the clone's allocation in lock-step with the source row.
+            // During early login indicators can appear late (e.g. Wi-Fi), and
+            // forcing relayout prevents temporary icon squashing.
+            this._syncCloneLayout = () => {
+                if (!this._clone || !this._cloneSource)
+                    return;
+
+                let width = this._cloneSource.width;
+                let height = this._cloneSource.height;
+
+                if (width <= 0 || height <= 0) {
+                    const [, natWidth] = this._cloneSource.get_preferred_width(-1);
+                    const [, natHeight] = this._cloneSource.get_preferred_height(-1);
+                    width = natWidth;
+                    height = natHeight;
+                }
+
+                if (width > 0 && height > 0)
+                    this._clone.set_size(width, height);
+
+                this.queue_relayout();
+            };
+
+            this._sourceAllocationId = source.connect(
+                'notify::allocation', this._syncCloneLayout);
+            // Child changes can resize the indicator row as services appear
+            // during session startup (e.g. network indicator).
+            this._sourceChildAddedId = 0;
+            this._sourceChildRemovedId = 0;
+            try {
+                this._sourceChildAddedId = source.connect(
+                    'child-added', this._syncCloneLayout);
+                this._sourceChildRemovedId = source.connect(
+                    'child-removed', this._syncCloneLayout);
+            } catch (e) {
+                // Some actors may not expose child signals; allocation sync
+                // above is still enough to keep the clone usable.
+                this._sourceChildAddedId = 0;
+                this._sourceChildRemovedId = 0;
+            }
+
+            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                this._syncCloneLayout();
+                return GLib.SOURCE_REMOVE;
+            });
+
+            // Mirror the primary menu's open state as :checked so the pill
+            // stays visible while the quick-settings panel is open.
+            this._qsMenuStateId = qs.menu.connect('open-state-changed',
+                (_m, open) => {
+                    if (open)
+                        this.add_style_pseudo_class('checked');
+                    else
+                        this.remove_style_pseudo_class('checked');
+                });
         } else {
             this.add_child(new St.Icon({
                 icon_name: 'emblem-system-symbolic',
@@ -261,6 +320,26 @@ class MultiMonitorsQuickSettings extends PanelMenu.Button {
     }
 
     _onDestroy() {
+        if (this._cloneSource) {
+            if (this._sourceAllocationId)
+                this._cloneSource.disconnect(this._sourceAllocationId);
+            if (this._sourceChildAddedId)
+                this._cloneSource.disconnect(this._sourceChildAddedId);
+            if (this._sourceChildRemovedId)
+                this._cloneSource.disconnect(this._sourceChildRemovedId);
+
+            this._sourceAllocationId = 0;
+            this._sourceChildAddedId = 0;
+            this._sourceChildRemovedId = 0;
+            this._cloneSource = null;
+        }
+
+        if (this._qsMenuStateId) {
+            const qs = Main.panel.statusArea.quickSettings;
+            if (qs?.menu)
+                qs.menu.disconnect(this._qsMenuStateId);
+            this._qsMenuStateId = 0;
+        }
         if (this._qsClosedId) {
             const qs = Main.panel.statusArea.quickSettings;
             if (qs) {

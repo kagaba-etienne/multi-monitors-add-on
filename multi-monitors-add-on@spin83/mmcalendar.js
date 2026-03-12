@@ -87,6 +87,19 @@ class MultiMonitorsDateMenuButton extends PanelMenu.Button {
             'clock', this._clockDisplay, 'text',
             GObject.BindingFlags.SYNC_CREATE);
 
+        // Mirror the primary menu's open state as :checked so the clock pill
+        // stays visible while the calendar/notifications panel is open.
+        const dmForState = Main.panel.statusArea.dateMenu;
+        if (dmForState?.menu) {
+            this._dmMenuStateId = dmForState.menu.connect('open-state-changed',
+                (_m, open) => {
+                    if (open)
+                        this.add_style_pseudo_class('checked');
+                    else
+                        this.remove_style_pseudo_class('checked');
+                });
+        }
+
         // ── Session sensitivity ───────────────────────────────────────────
         this._sessionModeId = Main.sessionMode.connect(
             'updated', this._sessionUpdated.bind(this));
@@ -133,6 +146,12 @@ class MultiMonitorsDateMenuButton extends PanelMenu.Button {
                 dm.menu.disconnect(this._dmClosedId);
             }
             this._dmClosedId = 0;
+        }
+        if (this._dmMenuStateId) {
+            const dm = Main.panel.statusArea.dateMenu;
+            if (dm?.menu)
+                dm.menu.disconnect(this._dmMenuStateId);
+            this._dmMenuStateId = 0;
         }
         if (this._bellOpacityId) {
             const dm = Main.panel.statusArea.dateMenu;
