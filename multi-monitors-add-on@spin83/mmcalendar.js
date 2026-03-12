@@ -17,14 +17,15 @@ along with this program; if not, visit https://www.gnu.org/licenses/.
 
 // mmcalendar.js — Secondary-monitor date/time button for GNOME Shell 46.
 //
-// In GNOME 46 the old internal helper classes (FreezableBinLayout,
-// TodayButton, CalendarColumnLayout, EventsSection, MessagesIndicator,
-// NotificationSection, CalendarMessageList from the old codebase) were either
-// made private or removed.  This module provides a simplified but functional
-// replacement using the public GNOME 46 Calendar API.
+// Proxies the primary panel's dateMenu rather than duplicating the full widget:
+//   • Clock is kept in sync via GnomeDesktop.WallClock.
+//   • Bell/DND icon is a local St.Icon whose visible + icon-name are kept in
+//     sync with the primary panel's MessagesIndicator via GObject.bind_property.
+//     The icon sits to the RIGHT of the clock, matching expected UX.
+//   • Clicks redirect dateMenu.menu.sourceActor to this button so BoxPointer
+//     positions the popup on the secondary monitor, then restores the original.
 
 import Clutter from 'gi://Clutter';
-import GLib from 'gi://GLib';
 import GnomeDesktop from 'gi://GnomeDesktop';
 import GObject from 'gi://GObject';
 import Pango from 'gi://Pango';
@@ -32,95 +33,118 @@ import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
-import * as Calendar from 'resource:///org/gnome/shell/ui/calendar.js';
-
-// ─── MultiMonitorsDateMenuButton ──────────────────────────────────────────────
-// A PanelMenu.Button that shows a live clock label.  Clicking it opens a
-// popup containing a calendar widget and the notification message list,
-// mirroring the primary panel's date-menu behaviour with the public API.
 
 export const MultiMonitorsDateMenuButton = GObject.registerClass(
 class MultiMonitorsDateMenuButton extends PanelMenu.Button {
     _init() {
         super._init(0.5);
 
-        // ── Clock label ───────────────────────────────────────────────────
+        // ── Button contents ───────────────────────────────────────────────
+        // Layout: [ clock label ][ bell icon ]
+        // Bell sits to the RIGHT of the clock, visible only when needed.
+        const box = new St.BoxLayout({ style_class: 'clock-display-box' });
+        this.add_child(box);
+        this.add_style_class_name('clock-display');
+
+        // Clock label.
         this._clockDisplay = new St.Label({
             style_class: 'clock',
             y_align: Clutter.ActorAlign.CENTER,
         });
         this._clockDisplay.clutter_text.y_align = Clutter.ActorAlign.CENTER;
         this._clockDisplay.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
-
-        let box = new St.BoxLayout({ style_class: 'clock-display-box' });
         box.add_child(this._clockDisplay);
-        this.add_actor(box);
-        this.add_style_class_name('clock-display');
         this.label_actor = this._clockDisplay;
 
-        // GnomeDesktop.WallClock provides the formatted clock string and
-        // emits notify::clock whenever the display string changes.
+        // Bell / DND icon — a fresh St.Icon to the right of the clock.
+        // Important: we manage visibility via OPACITY (0 ↔ 255) rather than
+        // the visible property, so the icon is always allocated the same space
+        // and the clock label never shifts when the bell appears or disappears.
+        const dm = Main.panel.statusArea.dateMenu;
+        if (dm?._indicator) {
+            this._bellIcon = new St.Icon({
+                style_class: 'system-status-icon',
+                y_align: Clutter.ActorAlign.CENTER,
+                icon_name: dm._indicator.icon_name,
+                opacity: dm._indicator.visible ? 255 : 0,
+            });
+            box.add_child(this._bellIcon);
+
+            // Sync opacity from primary indicator's visible state.
+            this._bellOpacityId = dm._indicator.connect('notify::visible', src => {
+                this._bellIcon.opacity = src.visible ? 255 : 0;
+            });
+            // Sync icon name (bell, bell-disabled, etc.).
+            this._bellIconBinding = dm._indicator.bind_property(
+                'icon-name', this._bellIcon, 'icon-name',
+                GObject.BindingFlags.SYNC_CREATE);
+        }
+
+        // Live clock via GnomeDesktop.WallClock (same underlying clock the
+        // primary panel uses, so both always display the same formatted string).
         this._clock = new GnomeDesktop.WallClock();
         this._clockBinding = this._clock.bind_property(
-            'clock',
-            this._clockDisplay, 'text',
+            'clock', this._clockDisplay, 'text',
             GObject.BindingFlags.SYNC_CREATE);
-        this._clockTimezoneId = this._clock.connect(
-            'notify::timezone', this._onTimezoneChanged.bind(this));
 
-        // ── Popup layout ──────────────────────────────────────────────────
-        // Left column: CalendarMessageList (notifications + DND + Clear)
-        // Right column: Calendar widget
-        let hbox = new St.BoxLayout({ name: 'calendarArea' });
-        this.menu.box.add_child(hbox);
-
-        // Left: message list (notifications, DND switch, clear button).
-        // Calendar.CalendarMessageList is public in GNOME 46.
-        this._messageList = new Calendar.CalendarMessageList();
-        hbox.add_child(this._messageList);
-
-        // Right: calendar
-        let vbox = new St.BoxLayout({
-            style_class: 'datemenu-calendar-column',
-            vertical: true,
-        });
-        hbox.add_child(vbox);
-
-        this._calendar = new Calendar.Calendar();
-        vbox.add_child(this._calendar);
-
-        // ── Session + date selection ──────────────────────────────────────
-        this._sessionModeUpdatedId = Main.sessionMode.connect(
+        // ── Session sensitivity ───────────────────────────────────────────
+        this._sessionModeId = Main.sessionMode.connect(
             'updated', this._sessionUpdated.bind(this));
         this._sessionUpdated();
 
-        // When the menu opens, jump to today.
-        this._openStateChangedId = this.menu.connect(
-            'open-state-changed', (_menu, isOpen) => {
-                if (isOpen) {
-                    let now = new Date();
-                    this._calendar.setDate(now);
-                }
-            });
-
         this.connect('destroy', this._onDestroy.bind(this));
-    }
-
-    _onTimezoneChanged() {
-        this._calendar.updateTimeZone();
     }
 
     _sessionUpdated() {
         this.sensitive = !Main.sessionMode.isLocked;
     }
 
-    _onDestroy() {
-        if (this._openStateChangedId) {
-            this.menu.disconnect(this._openStateChangedId);
-            this._openStateChangedId = 0;
+    vfunc_event(event) {
+        if (event.type() === Clutter.EventType.TOUCH_END ||
+            event.type() === Clutter.EventType.BUTTON_RELEASE) {
+            const dm = Main.panel.statusArea.dateMenu;
+            if (dm) {
+                if (!dm.menu.isOpen) {
+                    // Redirect the popup's anchor to this secondary-panel
+                    // button so BoxPointer opens on the right monitor.
+                    this._dmOrigSource = dm.menu.sourceActor;
+                    dm.menu.sourceActor = this;
+                    this._dmClosedId = dm.menu.connect('open-state-changed',
+                        (_m, open) => {
+                            if (!open) {
+                                dm.menu.sourceActor = this._dmOrigSource;
+                                dm.menu.disconnect(this._dmClosedId);
+                                this._dmClosedId = 0;
+                            }
+                        });
+                }
+                dm.menu.toggle();
+            }
         }
-        Main.sessionMode.disconnect(this._sessionModeUpdatedId);
-        this._clock.disconnect(this._clockTimezoneId);
+        return Clutter.EVENT_PROPAGATE;
+    }
+
+    _onDestroy() {
+        // Restore sourceActor if the menu happens to be open when we're destroyed.
+        if (this._dmClosedId) {
+            const dm = Main.panel.statusArea.dateMenu;
+            if (dm) {
+                dm.menu.sourceActor = this._dmOrigSource;
+                dm.menu.disconnect(this._dmClosedId);
+            }
+            this._dmClosedId = 0;
+        }
+        if (this._bellOpacityId) {
+            const dm = Main.panel.statusArea.dateMenu;
+            if (dm?._indicator)
+                dm._indicator.disconnect(this._bellOpacityId);
+            this._bellOpacityId = 0;
+        }
+        if (this._bellIconBinding) {
+            this._bellIconBinding.unbind();
+            this._bellIconBinding = null;
+        }
+        Main.sessionMode.disconnect(this._sessionModeId);
         this._clockBinding.unbind();
     }
 });

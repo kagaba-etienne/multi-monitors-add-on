@@ -19,7 +19,9 @@ import St from 'gi://St';
 import Meta from 'gi://Meta';
 import Atk from 'gi://Atk';
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Shell from 'gi://Shell';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Panel from 'resource:///org/gnome/shell/ui/panel.js';
@@ -181,7 +183,7 @@ class MultiMonitorsActivitiesButton extends PanelMenu.Button {
             text: _('Activities'),
             y_align: Clutter.ActorAlign.CENTER,
         });
-        this.add_actor(this._label);
+        this.add_child(this._label);
         this.label_actor = this._label;
 
         this._showingId = Main.overview.connect('showing', () => {
@@ -208,13 +210,107 @@ class MultiMonitorsActivitiesButton extends PanelMenu.Button {
     }
 });
 
+// ─── MultiMonitorsQuickSettings ───────────────────────────────────────────────
+// Proxy for the right side of the secondary panel.  Uses Clutter.Clone to
+// mirror the live icon row from the primary panel's quickSettings button
+// (battery level, wifi signal, volume, etc. all update automatically).
+// Clicks are forwarded to toggle the primary panel's quickSettings menu.
+
+export const MultiMonitorsQuickSettings = GObject.registerClass(
+class MultiMonitorsQuickSettings extends PanelMenu.Button {
+    _init() {
+        super._init(0.0, null, true);
+
+        const qs = Main.panel.statusArea.quickSettings;
+        if (qs) {
+            // _indicators is the St.BoxLayout that holds all the status icons.
+            const source = qs._indicators ?? qs;
+            this._clone = new Clutter.Clone({ source });
+            this.add_child(this._clone);
+        } else {
+            this.add_child(new St.Icon({
+                icon_name: 'emblem-system-symbolic',
+                style_class: 'system-status-icon',
+            }));
+        }
+    }
+
+    vfunc_event(event) {
+        if (event.type() === Clutter.EventType.TOUCH_END ||
+            event.type() === Clutter.EventType.BUTTON_RELEASE) {
+            const qs = Main.panel.statusArea.quickSettings;
+            if (qs) {
+                if (!qs.menu.isOpen) {
+                    // Redirect the menu's source actor to this secondary-panel
+                    // button so BoxPointer positions the popup on this monitor.
+                    this._qsOrigSource = qs.menu.sourceActor;
+                    qs.menu.sourceActor = this;
+                    this._qsClosedId = qs.menu.connect('open-state-changed',
+                        (_m, open) => {
+                            if (!open) {
+                                qs.menu.sourceActor = this._qsOrigSource;
+                                qs.menu.disconnect(this._qsClosedId);
+                                this._qsClosedId = 0;
+                            }
+                        });
+                }
+                qs.menu.toggle();
+            }
+        }
+        return Clutter.EVENT_PROPAGATE;
+    }
+
+    _onDestroy() {
+        if (this._qsClosedId) {
+            const qs = Main.panel.statusArea.quickSettings;
+            if (qs) {
+                qs.menu.sourceActor = this._qsOrigSource;
+                qs.menu.disconnect(this._qsClosedId);
+            }
+            this._qsClosedId = 0;
+        }
+        if (this._clone) {
+            this._clone.source = null;
+            this._clone = null;
+        }
+        super._onDestroy();
+    }
+});
+
 // ─── Panel item map ───────────────────────────────────────────────────────────
 // AppMenuButton was removed in GNOME 40 and is not included.
 
 const MULTI_MONITOR_PANEL_ITEM_IMPLEMENTATIONS = {
     activities: MultiMonitorsActivitiesButton,
     dateMenu: MMCalendar.MultiMonitorsDateMenuButton,
+    quickSettings: MultiMonitorsQuickSettings,
 };
+
+// ─── BlurRepaintEffect ────────────────────────────────────────────────────────
+// Shell.BlurEffect(BACKGROUND) does not repaint when the actors above it
+// change (e.g. panel-button :hover box-shadows), which causes a stale blurred
+// version of those shadows to appear as dark rectangles behind the buttons.
+// This lightweight Clutter.Effect, attached to the blur actor, forces the blur
+// to queue a repaint every paint cycle so it always samples a clean background.
+// Reference: https://gitlab.gnome.org/GNOME/gnome-shell/-/issues/2857
+const BlurRepaintEffect = GObject.registerClass(
+class BlurRepaintEffect extends Clutter.Effect {
+    _init(blurEffect) {
+        super._init();
+        this._blurEffect = blurEffect;
+        this._counter = 0;
+    }
+
+    vfunc_paint(node, paintContext, paintFlags) {
+        if (this._counter === 0) {
+            this._counter = 2;
+            this._blurEffect.queue_repaint();
+        } else {
+            this._counter--;
+        }
+        super.vfunc_paint(node, paintContext, paintFlags);
+    }
+});
 
 // ─── MultiMonitorsPanel ───────────────────────────────────────────────────────
 
@@ -224,7 +320,9 @@ export const MultiMonitorsPanel = (() => {
             super._init({ name: 'panel', reactive: true });
 
             this.monitorIndex = monitorIndex;
-            this.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
+            // Note: set_offscreen_redirect(ALWAYS) was removed — GNOME Shell 46's
+            // own panel does not use it, and it causes dark compositing artefacts
+            // with transparent blurred backgrounds.
 
             this._sessionStyle = null;
             this.statusArea = {};
@@ -247,6 +345,36 @@ export const MultiMonitorsPanel = (() => {
             });
 
             mmPanelBox.panelBox.add_child(this);
+
+            // ── Blur background ──────────────────────────────────────────────
+            // A zero-size Clutter.Actor is inserted at index 0 in the panel
+            // box so it doesn't affect the BoxLayout flow.  Inside it lives
+            // an St.Widget with Shell.BlurEffect(BACKGROUND) that is manually
+            // kept in sync with the panel's allocation.  The panel itself is
+            // given a transparent CSS override so the blur shows through.
+            this._blurContainer = new Clutter.Actor({ width: 0, height: 0, reactive: false });
+            this._blurActor = new St.Widget({ name: 'mmPanelBlurBackground', reactive: false });
+            const _blurEffect = new Shell.BlurEffect({
+                mode: Shell.BlurMode.BACKGROUND,
+                radius: 15,
+                brightness: 0.6,
+            });
+            this._blurActor.add_effect(_blurEffect);
+            this._blurActor.add_effect(new BlurRepaintEffect(_blurEffect));
+            this._blurContainer.add_child(this._blurActor);
+            mmPanelBox.panelBox.insert_child_at_index(this._blurContainer, 0);
+
+            // Keep blur actor geometry in sync with the panel.
+            this._blurSyncId = this.connect(
+                'notify::allocation', this._syncBlurGeometry.bind(this));
+            // Perform an initial sync once the actors are allocated.
+            GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                this._syncBlurGeometry();
+                return GLib.SOURCE_REMOVE;
+            });
+
+            // Make the panel background transparent so the blur shows through.
+            this.add_style_class_name('mm-blurred-panel');
             Main.ctrlAltTabManager.addGroup(
                 this, _('Top Bar'), 'focus-top-bar-symbolic',
                 { sortGroup: CtrlAltTab.SortGroup.TOP });
@@ -271,7 +399,26 @@ export const MultiMonitorsPanel = (() => {
             this.connect('destroy', this._onDestroy.bind(this));
         }
 
+        _syncBlurGeometry() {
+            if (!this._blurActor) return;
+            let [x, y] = this.get_position();
+            let [w, h] = this.get_size();
+            if (w === 0 || h === 0) return;
+            this._blurActor.set_position(x, y);
+            this._blurActor.set_size(w, h);
+        }
+
         _onDestroy() {
+            if (this._blurSyncId) {
+                this.disconnect(this._blurSyncId);
+                this._blurSyncId = 0;
+            }
+            if (this._blurContainer) {
+                this._blurContainer.destroy();
+                this._blurContainer = null;
+                this._blurActor = null; // destroyed with container
+            }
+
             global.display.disconnect(this._workareasChangedId);
             Main.overview.disconnect(this._showingId);
             Main.overview.disconnect(this._hidingId);
@@ -300,6 +447,19 @@ export const MultiMonitorsPanel = (() => {
                 return [0,
                     Main.layoutManager.monitors[this.monitorIndex].width];
             return [0, 0];
+        }
+
+        // Prevent the panel from acquiring the :hover pseudo-class when child
+        // buttons are hovered.  Child buttons handle their own :hover normally,
+        // but the propagated enter-event arriving at the panel would also trigger
+        // St.Widget's default enter handler which sets :hover on the panel,
+        // causing the theme to apply a tinted background over the blur.
+        vfunc_enter_event(_event) {
+            return Clutter.EVENT_PROPAGATE;
+        }
+
+        vfunc_leave_event(_event) {
+            return Clutter.EVENT_PROPAGATE;
         }
 
         _hideIndicators() {
