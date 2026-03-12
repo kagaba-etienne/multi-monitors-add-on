@@ -21,6 +21,7 @@ import Atk from 'gi://Atk';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Gio from 'gi://Gio';
 import Shell from 'gi://Shell';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -433,13 +434,13 @@ export const MultiMonitorsPanel = (() => {
             // given a transparent CSS override so the blur shows through.
             this._blurContainer = new Clutter.Actor({ width: 0, height: 0, reactive: false });
             this._blurActor = new St.Widget({ name: 'mmPanelBlurBackground', reactive: false });
-            const _blurEffect = new Shell.BlurEffect({
+            this._blurEffect = new Shell.BlurEffect({
                 mode: Shell.BlurMode.BACKGROUND,
                 radius: 15,
                 brightness: 0.6,
             });
-            this._blurActor.add_effect(_blurEffect);
-            this._blurActor.add_effect(new BlurRepaintEffect(_blurEffect));
+            this._blurActor.add_effect(this._blurEffect);
+            this._blurActor.add_effect(new BlurRepaintEffect(this._blurEffect));
             this._blurContainer.add_child(this._blurActor);
             mmPanelBox.panelBox.insert_child_at_index(this._blurContainer, 0);
 
@@ -451,6 +452,16 @@ export const MultiMonitorsPanel = (() => {
                 this._syncBlurGeometry();
                 return GLib.SOURCE_REMOVE;
             });
+
+            // When the wallpaper changes, Shell.BlurEffect(BACKGROUND) holds a
+            // stale texture snapshot of the old background.  Recreating the
+            // effect forces GNOME Shell to reinitialise its blur pipeline with
+            // the new wallpaper texture.
+            this._backgroundSettings = new Gio.Settings({
+                schema_id: 'org.gnome.desktop.background',
+            });
+            this._bgChangedId = this._backgroundSettings.connect(
+                'changed', this._refreshBlur.bind(this));
 
             // Make the panel background transparent so the blur shows through.
             this.add_style_class_name('mm-blurred-panel');
@@ -487,7 +498,25 @@ export const MultiMonitorsPanel = (() => {
             this._blurActor.set_size(w, h);
         }
 
+        _refreshBlur() {
+            if (!this._blurActor) return;
+            // Remove and re-add the blur effect so GNOME Shell reinitialises
+            // its internal blur pipeline, picking up the new wallpaper texture.
+            this._blurActor.remove_all_effects();
+            this._blurEffect = new Shell.BlurEffect({
+                mode: Shell.BlurMode.BACKGROUND,
+                radius: 15,
+                brightness: 0.6,
+            });
+            this._blurActor.add_effect(this._blurEffect);
+            this._blurActor.add_effect(new BlurRepaintEffect(this._blurEffect));
+        }
+
         _onDestroy() {
+            if (this._bgChangedId) {
+                this._backgroundSettings.disconnect(this._bgChangedId);
+                this._bgChangedId = 0;
+            }
             if (this._blurSyncId) {
                 this.disconnect(this._blurSyncId);
                 this._blurSyncId = 0;
